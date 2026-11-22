@@ -2,12 +2,16 @@
 
 上游依赖快照版本模块提供变更前快照，下游联动回填任务进行存量数据迁移。
 兼容性检查是核心：变更类型与兼容级别必须匹配，不兼容变更需要回填。
+
+提交审批时引用的变更前快照，必须是本湖表已生成完成、内容落库齐全的
+可用快照；只登记了版本号、内容还没确认的占位快照不能进入审批引用。
 """
 from __future__ import annotations
 
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.snapshot_version import SnapshotVersionService
 from app.store import store
 
 
@@ -29,8 +33,11 @@ class SchemaEvolutionService(BaseModuleService):
     ACTION_RULES = {"提交审批": "待审批", "执行变更": "已执行"}
     NEGATIVE_ACTIONS = []
 
+    def __init__(self) -> None:
+        self._snapshots = SnapshotVersionService()
+
     def submit_approval(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
-        """提交审批：执行兼容性检查。"""
+        """提交审批：兼容性检查 + 变更前快照可用性核对。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, "Schema 变更不存在"
@@ -49,13 +56,19 @@ class SchemaEvolutionService(BaseModuleService):
                 f"允许的操作：{'、'.join(allowed) if allowed else '无'}",
             )
 
-        # 检查变更前快照是否可用
+        # 核对变更前快照：必须引用本湖表已生成完成、内容落库齐全的版本，
+        # 同号但属于其他湖表的快照、或本表仍在生成中的占位快照都不能用
         snapshot_ref = entry.get("变更前快照", "")
         if snapshot_ref:
-            snapshots = store.find_by_field("snapshot_version", "版本号", snapshot_ref)
-            available = [s for s in snapshots if s.get("status") == "可用"]
+            table_name = entry.get("湖表名", "")
+            matches = self._snapshots.find_snapshots(table_name, snapshot_ref)
+            if not matches:
+                return None, f"湖表 {table_name} 不存在版本 {snapshot_ref} 的快照，不可提交审批"
+            available = [s for s in matches if s.get("status") == "可用"]
             if not available:
-                return None, f"变更前快照 {snapshot_ref} 不可用"
+                return None, f"变更前快照 {snapshot_ref} 仍在生成中，内容未确认，不可提交审批"
+            if not any(self._snapshots.is_snapshot_complete(s) for s in available):
+                return None, f"变更前快照 {snapshot_ref} 数据未落库齐全，不可提交审批"
 
         entry["status"] = "待审批"
         entry["pending"] = True
@@ -69,6 +82,51 @@ class SchemaEvolutionService(BaseModuleService):
         })
 
         return entry, f"Schema 变更 {entry.get('湖表名')} - {change_type} 已提交审批，兼容级别={compat_level}"
+
+    def snapshot_context(self, entry_id: int) -> dict[str, Any] | None:
+        """审批详情：从变更前快照的引用读出当时冻结的湖表结构。
+
+        已提交的变更可以据此复查前置结构：关联表、快照版本、
+        当时的分区键和存储格式都来自冻结内容，不受后续登记修改影响。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None
+
+        table_name = entry.get("湖表名", "")
+        snapshot_ref = entry.get("变更前快照", "")
+        context: dict[str, Any] = {
+            "entry_id": entry_id,
+            "湖表名": table_name,
+            "变更前快照": snapshot_ref,
+            "快照状态": "未引用",
+            "内容完整": False,
+            "分区键": "",
+            "存储格式": "",
+            "冻结内容": [],
+        }
+        if not snapshot_ref:
+            return context
+
+        matches = self._snapshots.find_snapshots(table_name, snapshot_ref)
+        if not matches:
+            context["快照状态"] = "未找到"
+            return context
+
+        # 优先取内容落库齐全的可用版本
+        snapshot = next(
+            (s for s in matches if self._snapshots.is_snapshot_complete(s)),
+            matches[0],
+        )
+        content = self._snapshots.snapshot_content(snapshot) or []
+        context["快照状态"] = snapshot.get("status", "")
+        context["内容完整"] = self._snapshots.is_snapshot_complete(snapshot)
+        context["冻结内容"] = content
+        if content:
+            first = content[0]
+            context["分区键"] = first.get("分区键", "")
+            context["存储格式"] = first.get("存储格式", "")
+        return context
 
     def execute_change(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
         """执行 Schema 变更：联动回填任务进行存量数据迁移。"""
@@ -122,20 +180,24 @@ class SchemaEvolutionService(BaseModuleService):
         snapshot_ref = entry.get("变更前快照", "")
         table_name = entry.get("湖表名", "")
 
-        # 尝试恢复快照
+        # 尝试恢复快照：按本湖表 + 版本号定位已冻结的快照内容
+        restored = False
         if snapshot_ref:
-            # 查找该类快照
-            for key in store.snapshot_keys():
-                if snapshot_ref in key and table_name in key:
-                    entry["status"] = "已回滚"
-                    entry["pending"] = False
-                    entry["abnormal"] = False
-                    store.log_event("schema_rolled_back", "schema_evolution", "snapshot_version", {
-                        "entry_id": entry_id,
-                        "table_name": table_name,
-                        "snapshot_ref": snapshot_ref,
-                    })
-                    return entry, f"Schema 变更回滚到快照 {snapshot_ref}"
+            for snapshot in self._snapshots.find_snapshots(table_name, snapshot_ref):
+                if self._snapshots.snapshot_content(snapshot):
+                    restored = True
+                    break
+
+        if restored:
+            entry["status"] = "已回滚"
+            entry["pending"] = False
+            entry["abnormal"] = False
+            store.log_event("schema_rolled_back", "schema_evolution", "snapshot_version", {
+                "entry_id": entry_id,
+                "table_name": table_name,
+                "snapshot_ref": snapshot_ref,
+            })
+            return entry, f"Schema 变更回滚到快照 {snapshot_ref}"
 
         entry["status"] = "已回滚"
         entry["pending"] = False

@@ -95,6 +95,15 @@ class Store:
         self._snapshots[key] = copy.deepcopy(self.rows(module))
         return key
 
+    def freeze_snapshot(self, key: str, rows: list[dict[str, Any]]) -> str:
+        """把调用方一次性读出的内容整体深拷贝冻结，返回快照标识。
+
+        内容必须由调用方单次读取后传入，这里原子落库；同一 key 重新冻结时
+        整体覆盖，保证一份已冻结版本不会由两次读出的内容拼成。
+        """
+        self._snapshots[key] = copy.deepcopy(rows)
+        return key
+
     def get_snapshot(self, key: str) -> list[dict[str, Any]] | None:
         """按标识获取快照副本。"""
         raw = self._snapshots.get(key)

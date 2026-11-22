@@ -36,3 +36,15 @@ export type OverviewResult = {
   cards: { label: string; value: number }[]
   modules: { name: string; created: number; pending: number; abnormal: number }[]
 }
+
+/** Schema 审批详情读出的变更前快照上下文：关联表、版本和当时冻结的前置结构。 */
+export type SnapshotContext = {
+  entry_id: number
+  湖表名: string
+  变更前快照: string
+  快照状态: string
+  内容完整: boolean
+  分区键: string
+  存储格式: string
+  冻结内容: Record<string, string>[]
+}

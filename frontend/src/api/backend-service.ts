@@ -1,6 +1,6 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type { ActionResult, EntryRow, OverviewResult, PageResult, SnapshotContext } from '@/data/types'
 
 export { moduleMeta }
 
@@ -34,6 +34,15 @@ export async function runAction(
     method: 'POST',
     body: JSON.stringify({ action }),
   })
+  return await response.json()
+}
+
+export async function loadSnapshotContext(
+  key: string,
+  id: number,
+): Promise<SnapshotContext> {
+  const response = await request(`/api/${key}/${id}/snapshot-context`)
+  if (!response.ok) throw new Error('变更前快照上下文读取失败')
   return await response.json()
 }
 

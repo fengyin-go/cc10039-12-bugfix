@@ -82,6 +82,19 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     return entry
 
 
+@router.get("/{module}/{entry_id}/snapshot-context", response_model=dict)
+def entry_snapshot_context(module: str, entry_id: int) -> dict[str, Any]:
+    """审批详情扩展：模块支持快照上下文时，读出变更前快照冻结的前置结构。"""
+    service = require_service(module)
+    resolver = getattr(service, "snapshot_context", None)
+    if resolver is None:
+        raise HTTPException(status_code=404, detail=f"业务模块 {module} 不支持快照上下文")
+    context = resolver(entry_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
+    return context
+
+
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
